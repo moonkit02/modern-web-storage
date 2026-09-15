@@ -1,0 +1,6 @@
+# Captured browser sessions = LIVE credentials. Never commit them.
+*.json
+
+# Python
+__pycache__/
+*.pyc

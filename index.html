@@ -1,0 +1,207 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Session Crawl Test</title>
+<style>
+  body { font: 14px system-ui, sans-serif; max-width: 820px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; }
+  label { display: block; font-weight: 600; margin: 1rem 0 .3rem; }
+  input, textarea { width: 100%; box-sizing: border-box; font: inherit; padding: .5rem; }
+  textarea { height: 160px; font-family: ui-monospace, monospace; font-size: 12px; }
+  button { margin-top: 1rem; padding: .6rem 1.2rem; font: inherit; cursor: pointer; }
+  #out, #scanOut, .rbox { margin-top: .5rem; white-space: pre-wrap; font-family: ui-monospace, monospace;
+         font-size: 12px; background: #f5f5f5; padding: 1rem; border-radius: 6px; }
+  .rbox { min-height: 3rem; overflow-x: auto; }
+  #scanOut:empty { display: none; }
+  .muted { color: #666; font-weight: 400; font-size: 12px; }
+  a { color: #06c; }
+</style>
+
+<h1>Session Crawl Test</h1>
+<p class="muted">Assumes you already logged in and captured the session. Paste the target URL and the
+captured Playwright <code>storage_state.json</code>. The scraper (<code>auth_detect.py</code>) reports the
+auth material it found, then a headed-less crawl replays the session to prove it reaches a few authenticated URLs.</p>
+
+<label>Target URL</label>
+<input id="url" placeholder="https://webapp3.wimify.xyz">
+
+<label>Captured storage_state.json <span class="muted">(capture below, paste, or pick a file)</span></label>
+<div style="margin:.3rem 0 .5rem">
+  <button id="capStart" type="button">1. Open login browser</button>
+  <button id="capDump" type="button">2. I'm logged in — capture</button>
+  <span id="capMsg" class="muted"></span>
+</div>
+<input type="file" id="file" accept=".json,application/json">
+<textarea id="storage" placeholder='{ "cookies": [...], "origins": [...] }'></textarea>
+
+<label>Crawl bounds <span class="muted">(Playwright pre-flight)</span></label>
+<div style="display:flex; gap:.6rem; flex-wrap:wrap; align-items:end">
+  <span>Max pages <input id="maxPages" type="number" min="1" value="8" style="width:5rem"></span>
+  <span>Max depth <input id="maxDepth" type="number" min="1" value="2" style="width:5rem"></span>
+  <span>Max children/page <input id="maxChildren" type="number" min="1" value="20" style="width:5rem"></span>
+  <span>Max duration (s) <input id="maxDuration" type="number" min="1" value="60" style="width:5rem"></span>
+</div>
+
+<button id="go">Detect + crawl (Playwright pre-flight)</button>
+<button id="goZap" type="button">Crawl with ZAP spider (real)</button>
+
+<hr style="margin:1.5rem 0">
+<h2 style="font-size:1.05rem">Compare &amp; scan</h2>
+<p class="muted">Run one or both crawls above. Results show side by side; pick the more usable list,
+then passive-scan it through the built az-dast image (no attack traffic).</p>
+<div style="display:flex; gap:1rem; flex-wrap:wrap">
+  <div style="flex:1; min-width:300px">
+    <label style="font-weight:400; margin-top:0"><input type="radio" name="which" value="play">
+      <b>Playwright pre-flight</b> — <b id="nPlay">0</b> URLs (<span id="nPlayReal">0</span> non-asset)</label>
+    <div id="outPlay" class="rbox"></div>
+  </div>
+  <div style="flex:1; min-width:300px">
+    <label style="font-weight:400; margin-top:0"><input type="radio" name="which" value="zap">
+      <b>ZAP spider</b> — <b id="nZap">0</b> URLs (<span id="nZapReal">0</span> non-asset)</label>
+    <div id="outZap" class="rbox"></div>
+  </div>
+</div>
+<div style="margin-top:1rem">
+  <button id="goScan" type="button">Initiate passive scan (chosen list)</button>
+  <span id="scanMsg" class="muted"></span>
+</div>
+<div id="scanOut"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+$('file').addEventListener('change', async e => {
+  const f = e.target.files[0];
+  if (f) $('storage').value = await f.text();
+});
+$('capStart').addEventListener('click', async () => {
+  const msg = $('capMsg');
+  msg.textContent = 'launching Chrome...';
+  try {
+    const r = await fetch('/capture/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: $('url').value.trim() || 'about:blank' }),
+    });
+    const d = await r.json();
+    msg.textContent = d.ok ? 'Chrome open — log in, then click "capture".' : ('Error: ' + d.error);
+  } catch (e) { msg.textContent = 'Failed: ' + e; }
+});
+$('capDump').addEventListener('click', async () => {
+  const msg = $('capMsg');
+  msg.textContent = 'capturing session...';
+  try {
+    const r = await fetch('/capture/dump', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: $('url').value.trim() }),   // scope the capture to this target
+    });
+    const d = await r.json();
+    if (d.error) { msg.textContent = 'Error: ' + d.error; return; }
+    $('storage').value = JSON.stringify(d.storage_state, null, 2);
+    // respect a target the user already typed; only auto-fill from the session when it's empty
+    let tgt = '';
+    if (d.target_url && !$('url').value.trim()) { $('url').value = d.target_url; tgt = ' target set to ' + d.target_url + '.'; }
+    else if (d.target_url) { tgt = ' (kept your target: ' + $('url').value.trim() + ')'; }
+    const scope = ' Kept ' + d.kept_cookies + ' cookies for this site, dropped ' + d.dropped_cookies + ' from other sites.';
+    msg.textContent = (d.auth ? ('captured — auth: ' + d.auth.scheme + '.') : ('captured, but NO auth found: ' + d.summary + '.')) + tgt + scope;
+  } catch (e) { msg.textContent = 'Failed: ' + e; }
+});
+$('go').addEventListener('click', async () => {
+  const out = $('outPlay');
+  let storage;
+  try { storage = JSON.parse($('storage').value); }
+  catch { out.textContent = 'storage_state is not valid JSON.'; return; }
+  if (!$('url').value.trim()) { out.textContent = 'Enter a target URL.'; return; }
+  out.textContent = 'Running (login replay + crawl, ~10-30s)...';
+  $('go').disabled = true;
+  try {
+    const r = await fetch('/crawl', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: $('url').value.trim(), storage_state: storage,
+        max_pages: +$('maxPages').value, max_depth: +$('maxDepth').value,
+        max_children: +$('maxChildren').value, max_duration: +$('maxDuration').value,
+      }),
+    });
+    const d = await r.json();
+    if (d.error) { out.textContent = 'Error: ' + d.error; return; }
+    const lines = [];
+    lines.push('Detected auth (auth_detect.py): ' + (d.auth ? JSON.stringify(d.auth) : 'NONE'));
+    lines.push('Captured session: ' + d.summary);
+    lines.push('Landed logged-in: ' + (d.logged_in ? 'YES' : 'NO (looks logged-out / login page)'));
+    lines.push('');
+    lines.push('Crawled ' + d.crawled.length + ' URL(s):');
+    d.crawled.forEach(u => lines.push('  ' + u));
+    out.textContent = lines.join('\n');
+    crawlLists.play = d.crawled; updateChooser();   // feed the compare/scan step
+  } catch (err) {
+    out.textContent = 'Request failed: ' + err;
+  } finally {
+    $('go').disabled = false;
+  }
+});
+$('goZap').addEventListener('click', async () => {
+  const out = $('outZap');
+  let storage;
+  try { storage = JSON.parse($('storage').value); }
+  catch { out.textContent = 'storage_state is not valid JSON.'; return; }
+  if (!$('url').value.trim()) { out.textContent = 'Enter a target URL.'; return; }
+  out.textContent = 'Running real ZAP traditional spider (HTTP, no JS)... can take a few minutes.';
+  $('goZap').disabled = true;
+  try {
+    const r = await fetch('/crawl-zap', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: $('url').value.trim(), storage_state: storage }),
+    });
+    const d = await r.json();
+    if (d.error) { out.textContent = 'Error: ' + d.error; return; }
+    const lines = [];
+    lines.push('Injected auth: ' + (d.auth ? d.auth.scheme : 'NONE'));
+    lines.push('ZAP spider found ' + d.crawled.length + ' URL(s):');
+    d.crawled.forEach(u => lines.push('  ' + u));
+    out.textContent = lines.join('\n');
+    crawlLists.zap = d.crawled; updateChooser();   // feed the compare/scan step
+  } catch (err) {
+    out.textContent = 'Request failed: ' + err;
+  } finally {
+    $('goZap').disabled = false;
+  }
+});
+
+// --- compare & scan ---
+const crawlLists = { play: [], zap: [] };
+const ASSET = /\.(jpg|jpeg|png|gif|svg|woff2?|ico|pdf|css|js|ttf|eot|otf|mp4|webm|ogg|mov|avi|mkv|flv|wmv|m4v)(\?|$)/i;
+const nonAsset = urls => urls.filter(u => !ASSET.test(u)).length;
+function updateChooser() {
+  $('nPlay').textContent = crawlLists.play.length;
+  $('nPlayReal').textContent = nonAsset(crawlLists.play);
+  $('nZap').textContent = crawlLists.zap.length;
+  $('nZapReal').textContent = nonAsset(crawlLists.zap);
+}
+$('goScan').addEventListener('click', async () => {
+  const msg = $('scanMsg'), scanOut = $('scanOut');
+  const pick = document.querySelector('input[name=which]:checked');
+  if (!pick) { msg.textContent = 'Pick a list first.'; return; }
+  const urls = crawlLists[pick.value];
+  if (!urls.length) { msg.textContent = 'That list is empty — run its crawl first.'; return; }
+  let storage;
+  try { storage = JSON.parse($('storage').value); }
+  catch { msg.textContent = 'storage_state is not valid JSON.'; return; }
+  msg.textContent = 'passive-scanning ' + urls.length + ' URL(s) through az-dast...';
+  $('goScan').disabled = true; scanOut.textContent = '';
+  try {
+    const r = await fetch('/scan', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: $('url').value.trim(), storage_state: storage, urls }),
+    });
+    const d = await r.json();
+    if (d.error) { msg.textContent = 'Error: ' + d.error; return; }
+    msg.textContent = 'scanned ' + d.scanned + ' URL(s), injected auth: ' + (d.auth ? d.auth.scheme : 'NONE') + '.';
+    const lines = ['Passive alerts (' + d.alerts.length + ' types):'];
+    d.alerts.forEach(a => lines.push('  [' + a.risk + '] ' + a.alert + (a.count > 1 ? '  x' + a.count : '')));
+    scanOut.textContent = lines.join('\n');
+  } catch (err) {
+    msg.textContent = 'Request failed: ' + err;
+  } finally {
+    $('goScan').disabled = false;
+  }
+});
+</script>
