@@ -12,7 +12,6 @@
   #out, #scanOut, .rbox { margin-top: .5rem; white-space: pre-wrap; font-family: ui-monospace, monospace;
          font-size: 12px; background: #f5f5f5; padding: 1rem; border-radius: 6px; }
   .rbox { min-height: 3rem; overflow-x: auto; }
-  #scanOut:empty { display: none; }
   .muted { color: #666; font-weight: 400; font-size: 12px; }
   a { color: #06c; }
 </style>
@@ -36,36 +35,52 @@ auth material it found, then a headed-less crawl replays the session to prove it
 
 <label>Crawl bounds <span class="muted">(Playwright pre-flight)</span></label>
 <div style="display:flex; gap:.6rem; flex-wrap:wrap; align-items:end">
-  <span>Max pages <input id="maxPages" type="number" min="1" value="8" style="width:5rem"></span>
-  <span>Max depth <input id="maxDepth" type="number" min="1" value="2" style="width:5rem"></span>
+  <span>Max pages <input id="maxPages" type="number" min="1" value="30" style="width:5rem"></span>
+  <span>Max depth <input id="maxDepth" type="number" min="1" value="5" style="width:5rem"></span>
   <span>Max children/page <input id="maxChildren" type="number" min="1" value="20" style="width:5rem"></span>
   <span>Max duration (s) <input id="maxDuration" type="number" min="1" value="60" style="width:5rem"></span>
 </div>
 
 <button id="go">Detect + crawl (Playwright pre-flight)</button>
-<button id="goZap" type="button">Crawl with ZAP spider (real)</button>
+<button id="goZap" type="button">Crawl with az-dast image (docker run)</button>
 
 <hr style="margin:1.5rem 0">
-<h2 style="font-size:1.05rem">Compare &amp; scan</h2>
-<p class="muted">Run one or both crawls above. Results show side by side; pick the more usable list,
-then passive-scan it through the built az-dast image (no attack traffic).</p>
+<h2 style="font-size:1.05rem">Crawl comparison</h2>
+<p class="muted">The Playwright pre-flight (client-side, renders JS) vs the az-dast image's own crawl.
+For reference — the passive scan below runs the container, which crawls the target itself.</p>
 <div style="display:flex; gap:1rem; flex-wrap:wrap">
   <div style="flex:1; min-width:300px">
-    <label style="font-weight:400; margin-top:0"><input type="radio" name="which" value="play">
-      <b>Playwright pre-flight</b> — <b id="nPlay">0</b> URLs (<span id="nPlayReal">0</span> non-asset)</label>
+    <label style="font-weight:400; margin-top:0"><b>Playwright pre-flight</b> —
+      <b id="nPlay">0</b> URLs (<span id="nPlayReal">0</span> non-asset)</label>
     <div id="outPlay" class="rbox"></div>
   </div>
   <div style="flex:1; min-width:300px">
-    <label style="font-weight:400; margin-top:0"><input type="radio" name="which" value="zap">
-      <b>ZAP spider</b> — <b id="nZap">0</b> URLs (<span id="nZapReal">0</span> non-asset)</label>
+    <label style="font-weight:400; margin-top:0"><b>az-dast crawl</b> —
+      <b id="nZap">0</b> URLs (<span id="nZapReal">0</span> non-asset)</label>
     <div id="outZap" class="rbox"></div>
   </div>
 </div>
-<div style="margin-top:1rem">
-  <button id="goScan" type="button">Initiate passive scan (chosen list)</button>
-  <span id="scanMsg" class="muted"></span>
+
+<hr style="margin:1.5rem 0">
+<h2 style="font-size:1.05rem">Passive scan (PROD image)</h2>
+<p class="muted" style="margin:.4rem 0">Each button runs the real <b>az-dast</b> image through its prod driver
+(<code>zap-baseline.py</code> + hook), which crawls + passive-scans the target. <b>With auth</b> injects
+the captured session the prod way (<code>SESSION_FILE</code>); <b>no auth</b> runs logged-out — run both
+to compare. No AJAX spider, no S3 upload. Slow (minutes).</p>
+<div style="margin-top:.5rem">
+  <button id="goScan" type="button">Passive scan — with auth</button>
+  <button id="goScanNoAuth" type="button">Passive scan — no auth</button>
 </div>
-<div id="scanOut"></div>
+<div style="display:flex; gap:1rem; flex-wrap:wrap; margin-top:.5rem">
+  <div style="flex:1; min-width:300px">
+    <label style="font-weight:400; margin-top:0"><b>With auth</b> <span id="scanMsg" class="muted"></span></label>
+    <div id="scanOut" class="rbox"></div>
+  </div>
+  <div style="flex:1; min-width:300px">
+    <label style="font-weight:400; margin-top:0"><b>No auth</b> <span id="scanMsgNo" class="muted"></span></label>
+    <div id="scanOutNo" class="rbox"></div>
+  </div>
+</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -144,7 +159,7 @@ $('goZap').addEventListener('click', async () => {
   try { storage = JSON.parse($('storage').value); }
   catch { out.textContent = 'storage_state is not valid JSON.'; return; }
   if (!$('url').value.trim()) { out.textContent = 'Enter a target URL.'; return; }
-  out.textContent = 'Running real ZAP traditional spider (HTTP, no JS)... can take a few minutes.';
+  out.textContent = 'Running the az-dast image (docker run, prod driver)... can take a few minutes.';
   $('goZap').disabled = true;
   try {
     const r = await fetch('/crawl-zap', {
@@ -154,8 +169,8 @@ $('goZap').addEventListener('click', async () => {
     const d = await r.json();
     if (d.error) { out.textContent = 'Error: ' + d.error; return; }
     const lines = [];
-    lines.push('Injected auth: ' + (d.auth ? d.auth.scheme : 'NONE'));
-    lines.push('ZAP spider found ' + d.crawled.length + ' URL(s):');
+    lines.push('Detected auth: ' + (d.auth ? d.auth.scheme : 'NONE'));
+    lines.push('az-dast crawl found ' + d.crawled.length + ' URL(s):');
     d.crawled.forEach(u => lines.push('  ' + u));
     out.textContent = lines.join('\n');
     crawlLists.zap = d.crawled; updateChooser();   // feed the compare/scan step
@@ -176,32 +191,34 @@ function updateChooser() {
   $('nZap').textContent = crawlLists.zap.length;
   $('nZapReal').textContent = nonAsset(crawlLists.zap);
 }
-$('goScan').addEventListener('click', async () => {
-  const msg = $('scanMsg'), scanOut = $('scanOut');
-  const pick = document.querySelector('input[name=which]:checked');
-  if (!pick) { msg.textContent = 'Pick a list first.'; return; }
-  const urls = crawlLists[pick.value];
-  if (!urls.length) { msg.textContent = 'That list is empty — run its crawl first.'; return; }
-  let storage;
-  try { storage = JSON.parse($('storage').value); }
-  catch { msg.textContent = 'storage_state is not valid JSON.'; return; }
-  msg.textContent = 'passive-scanning ' + urls.length + ' URL(s) through az-dast...';
-  $('goScan').disabled = true; scanOut.textContent = '';
+// Each scan runs the real az-dast image (serve.py: docker run -> report -> alerts).
+// no_auth=false injects the captured session via SESSION_FILE; no_auth=true runs logged-out.
+async function runScan(noAuth, btnId, msgEl, outEl) {
+  if (!$('url').value.trim()) { msgEl.textContent = 'Enter a target URL.'; return; }
+  const body = { url: $('url').value.trim(), no_auth: noAuth };
+  if (!noAuth) {
+    try { body.storage_state = JSON.parse($('storage').value); }
+    catch { msgEl.textContent = 'storage_state is not valid JSON.'; return; }
+  }
+  msgEl.textContent = 'running az-dast ' + (noAuth ? 'logged-out' : 'with session') + ' (~minutes)...';
+  $(btnId).disabled = true; outEl.textContent = '';
   try {
     const r = await fetch('/scan', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: $('url').value.trim(), storage_state: storage, urls }),
+      body: JSON.stringify(body),
     });
     const d = await r.json();
-    if (d.error) { msg.textContent = 'Error: ' + d.error; return; }
-    msg.textContent = 'scanned ' + d.scanned + ' URL(s), injected auth: ' + (d.auth ? d.auth.scheme : 'NONE') + '.';
+    if (d.error) { msgEl.textContent = 'Error: ' + d.error; outEl.textContent = d.error; return; }
+    msgEl.textContent = 'scanned ' + d.scanned + ' URL(s), auth: ' + (d.auth ? d.auth.scheme : 'NONE') + '.';
     const lines = ['Passive alerts (' + d.alerts.length + ' types):'];
     d.alerts.forEach(a => lines.push('  [' + a.risk + '] ' + a.alert + (a.count > 1 ? '  x' + a.count : '')));
-    scanOut.textContent = lines.join('\n');
+    outEl.textContent = lines.join('\n');
   } catch (err) {
-    msg.textContent = 'Request failed: ' + err;
+    msgEl.textContent = 'Request failed: ' + err;
   } finally {
-    $('goScan').disabled = false;
+    $(btnId).disabled = false;
   }
-});
+}
+$('goScan').addEventListener('click', () => runScan(false, 'goScan', $('scanMsg'), $('scanOut')));
+$('goScanNoAuth').addEventListener('click', () => runScan(true, 'goScanNoAuth', $('scanMsgNo'), $('scanOutNo')));
 </script>

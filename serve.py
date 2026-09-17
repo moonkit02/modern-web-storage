@@ -119,15 +119,6 @@ def capture_dump(target_hint=""):
     return scoped, target, kept, dropped
 
 
-ZAP_API = os.environ.get("ZAP_API", "http://127.0.0.1:8090")
-
-
-def _zap(path, **params):
-    import urllib.request
-    from urllib.parse import urlencode
-    return json.load(urllib.request.urlopen(ZAP_API + path + "?" + urlencode(params), timeout=120))
-
-
 def _clean(urls, max_repeat=2):
     """Drop spider path-loop URLs and de-dup, order preserved. A segment repeating 3+ times
     (/assets/public/assets/public/...) is the SPA-returns-200-for-any-path loop signature.
@@ -149,77 +140,102 @@ def _clean(urls, max_repeat=2):
     return out
 
 
-def _zap_inject_auth(storage_state):
-    """Detect the auth in a captured session and inject it into ZAP as Replacer header rules, so
-    every ZAP request is authenticated. Shared by the crawl and the scan. Returns the descriptor."""
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-        json.dump(storage_state, f); spath = f.name
-    auth = auth_detect.detect_auth(spath)
-    for d in ("zc-hdr", "zc-cookie", "zc-custom"):   # drop any rule a previous run left
-        try: _zap("/JSON/replacer/action/removeRule/", description=d)
-        except Exception: pass
-    if auth and auth["scheme"] == "bearer":
-        tok = auth["token"]
-        _zap("/JSON/replacer/action/addRule/", description="zc-hdr", enabled="true",
-             matchType="REQ_HEADER", matchRegex="false", matchString="Authorization", replacement="Bearer " + tok)
-        _zap("/JSON/replacer/action/addRule/", description="zc-cookie", enabled="true",
-             matchType="REQ_HEADER", matchRegex="false", matchString="Cookie", replacement="token=" + tok)
-    elif auth and auth["scheme"] == "cookie":
-        _zap("/JSON/replacer/action/addRule/", description="zc-cookie", enabled="true",
-             matchType="REQ_HEADER", matchRegex="false", matchString="Cookie", replacement=auth["cookie_header"])
-    elif auth and auth["scheme"] == "header":
-        _zap("/JSON/replacer/action/addRule/", description="zc-custom", enabled="true",
-             matchType="REQ_HEADER", matchRegex="false", matchString=auth["name"], replacement=auth["value"])
-    return auth
+PROD_IMAGE = os.environ.get("PROD_IMAGE", "az-dast:testing")
+# Passive-relevant slice of entrypoint.sh's ZAP_CONFIGS (keep in sync). Active-scan/AJAX keys are
+# left out on purpose: baseline mode never active-scans, and the AJAX spider needs a browser that
+# crashes under amd64 emulation on this Mac.
+PROD_ZAP_CONFIG = (
+    "-config http.response.max_size=1048576 "
+    "-config http.exclude_response_regex=.*\\.(jpg|jpeg|png|gif|svg|woff|woff2|ico|pdf|css|js|ttf|eot|otf|mp4|webm|ogg|mov|avi|mkv|flv|wmv|m4v) "
+    "-config timeoutInSecs=10 "
+    "-config database.persistent=false "
+    "-config passiveScan.maxAlertsPerRule=3 "
+    "-config spider.maxDepth=10 "
+    "-config spider.maxChildren=30 "
+    "-config spider.maxDuration=1800"
+)
 
-def zap_crawl(url, storage_state):
-    """Real ZAP traditional spider (HTTP, no JS) with the captured session injected as Replacer
-    header rules. Returns the URL set ZAP discovered. Needs the ZAP daemon (see README)."""
-    import time
-    # Fresh session: ZAP's spider only reports NEWLY seen URLs, so a repeat scan of a site already
-    # in the tree returns nothing. Wipe the tree first (Replacer auth rules survive this).
-    _zap("/JSON/core/action/newSession/", overwrite="true")
-    auth = _zap_inject_auth(storage_state)
+def _run_az_dast(url, storage_state, timeout=1200):
+    """The one place a scan actually runs: docker run the real az-dast image through its prod driver
+    (zap-baseline.py + the prod hook). storage_state=None runs logged-out; a dict is injected the prod
+    way (SESSION_FILE -> az_ai_auth.py inside the image). Baseline = spider + passive, no active scan.
+    Returns {urls, alerts, exit_code, log_tail}. Skips only the entrypoint's S3-upload tail (cloud
+    creds) and the AJAX spider (its browser crashes under amd64 emulation on this Mac)."""
+    name = "az-dast-" + os.urandom(4).hex()
+    sess = None
+    cmd = ["docker", "run", "-d", "--name", name, "--platform", "linux/amd64", "-m", "4g"]
+    if storage_state is not None:
+        sess = HERE / (".session-%s.json" % name)          # project dir is a Docker-shared path
+        sess.write_text(json.dumps(storage_state))
+        cmd += ["-v", "%s:/app/resources/session.json:ro" % sess,
+                "-e", "SESSION_FILE=/app/resources/session.json", "-e", "AI_AUTH_DIR=/app"]
+    cmd += ["--entrypoint", "zap-baseline.py", PROD_IMAGE,
+            "-t", url, "-I", "-d", "-J", "report.json",
+            "--hook", "/zap/wrk/hook/az-custom-hook.py",
+            "-z", PROD_ZAP_CONFIG]
+    try:
+        run = subprocess.run(cmd, capture_output=True, text=True)
+        if run.returncode != 0:
+            raise RuntimeError("docker run failed: " + (run.stderr.strip() or run.stdout.strip()))
+        code = subprocess.run(["docker", "wait", name], capture_output=True, text=True, timeout=timeout).stdout.strip()
+        got = subprocess.run(["docker", "logs", name], capture_output=True, text=True)
+        logs = got.stdout + got.stderr
+        report = HERE / (".report-%s.json" % name)
+        cp = subprocess.run(["docker", "cp", name + ":/zap/wrk/report.json", str(report)], capture_output=True, text=True)
+        data = json.loads(report.read_text()) if cp.returncode == 0 and report.exists() else {}
+        report.unlink(missing_ok=True)
+        # crawled URLs: the hook dumps them to the log on a session run; union with the report's URIs
+        log_urls = {ln.strip() for ln in logs.splitlines()
+                    if ln.strip().startswith(("http://", "https://")) and " " not in ln.strip()}
+        urls = _clean(sorted(log_urls | set(_report_uris(data))))
+        return {"urls": urls, "alerts": _report_alerts(data),
+                "exit_code": code, "log_tail": "\n".join(logs.splitlines()[-25:])}
+    finally:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        if sess is not None:
+            sess.unlink(missing_ok=True)
 
-    # Bound the spider so the SPA path-loop can't run away and starve real finds (/ftp/*).
-    # The bare daemon inherits the image's config (maxDepth may be 0 = unlimited); set our own.
-    _zap("/JSON/spider/action/setOptionMaxDepth/", Integer="5")
-    _zap("/JSON/spider/action/setOptionMaxDuration/", Integer="4")  # minutes, hard stop
-    sid = _zap("/JSON/spider/action/scan/", url=url, maxChildren="10", recurse="true")["scan"]
-    for _ in range(120):  # up to ~4 min
-        if _zap("/JSON/spider/view/status/", scanId=sid)["status"] == "100":
-            break
-        time.sleep(2)
-    results = _zap("/JSON/spider/view/results/", scanId=sid)["results"]
-    return _clean(results), (auth or None)
+def _report_uris(data):
+    """Every URL ZAP recorded a finding on, from the baseline JSON report's alert instances."""
+    return [inst["uri"] for site in data.get("site", []) for a in site.get("alerts", [])
+            for inst in a.get("instances", []) if inst.get("uri")]
 
-def zap_scan(target, storage_state, urls, max_urls=40):
-    """Passive scan a chosen URL list through the az-dast ZAP daemon: inject the session, fetch each
-    URL authenticated (accessUrl), let the passive rules run, return the alerts. No attack traffic.
-    urls = whichever crawl's list the user picked. Returns (alerts_grouped, auth, scanned_count)."""
-    import time
-    _zap("/JSON/core/action/newSession/", overwrite="true")  # fresh tree so only this run's URLs count
-    auth = _zap_inject_auth(storage_state)
-    _zap("/JSON/pscan/action/enableAllScanners/")
-    _zap("/JSON/core/action/deleteAllAlerts/")               # only these URLs' alerts remain
-    urls = [u for u in urls if u][:max_urls]                 # bound the work
-    for u in urls:
-        try: _zap("/JSON/core/action/accessUrl/", url=u, followRedirects="true")
-        except Exception: pass                               # a dead stub URL must not abort the scan
-    for _ in range(240):                                     # wait for the passive queue to drain
-        if int(_zap("/JSON/pscan/view/recordsToScan/")["recordsToScan"]) == 0:
-            break
-        time.sleep(0.5)
-    alerts = _zap("/JSON/core/view/alerts/", baseurl=target)["alerts"]
-    grouped = {}                                             # collapse duplicates: (name, risk) -> count
-    for a in alerts:
-        key = (a["alert"], a["risk"])
-        grouped[key] = grouped.get(key, 0) + 1
+def _report_alerts(data):
+    """Group the baseline JSON report into [{alert, risk, count}], most-severe first."""
+    grouped = {}
+    for site in data.get("site", []):
+        for a in site.get("alerts", []):
+            risk = (a.get("riskdesc", "") or "").split(" ")[0] or "Informational"
+            key = (a.get("alert") or a.get("name", "?"), risk)
+            grouped[key] = grouped.get(key, 0) + int(a.get("count") or len(a.get("instances", [])) or 1)
     out = [{"alert": n, "risk": r, "count": c} for (n, r), c in grouped.items()]
     order = {"High": 0, "Medium": 1, "Low": 2, "Informational": 3}
     out.sort(key=lambda x: (order.get(x["risk"], 9), -x["count"]))
-    return out, (auth or None), len(urls)
+    return out
 
+def _detect_auth(storage_state):
+    """Detect the session's auth scheme for display only (the container does the real injection)."""
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(storage_state, f); spath = f.name
+    try:
+        return auth_detect.detect_auth(spath)
+    finally:
+        os.unlink(spath)
+
+def zap_crawl(url, storage_state):
+    """zap_crawl(url, storage_state) -> docker run the prod img -> read the crawled URL list from its
+    report/log -> return (urls, auth_for_display). The image crawls the target with the session
+    injected via SESSION_FILE. Baseline passive-scans too; here we keep only the URLs."""
+    r = _run_az_dast(url, storage_state)
+    return r["urls"], (_detect_auth(storage_state) or None)
+
+def zap_scan(url, storage_state, no_auth=False):
+    """zap_scan(...) -> docker run the same prod img -> read the passive alerts from its report ->
+    return (alerts, auth_for_display, scanned_url_count). no_auth=True runs with no session, so the
+    two runs compare logged-in vs logged-out findings on the same target."""
+    r = _run_az_dast(url, None if no_auth else storage_state)
+    auth = None if no_auth else (_detect_auth(storage_state) or None)
+    return r["alerts"], auth, len(r["urls"])
 
 def crawl(url, storage_state, max_pages=8, max_depth=2, max_children=20, max_duration=60):
     """Replay the captured session; BFS same-origin links. Returns (visited_urls, logged_in_guess).
@@ -330,23 +346,22 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(400, json.dumps({"error": "need url and storage_state object"}))
                     return
                 results, auth = zap_crawl(url, storage)
-                self._send(200, json.dumps({"crawled": results, "auth": auth, "engine": "zap-spider"}))
+                self._send(200, json.dumps({"crawled": results, "auth": auth, "engine": "az-dast-baseline"}))
             except Exception as e:
-                self._send(502, json.dumps({"error": "ZAP unreachable or failed (%s: %s). Start the daemon: "
-                                            "see modern-web-storage/README.md" % (type(e).__name__, e)}))
+                self._send(502, json.dumps({"error": "az-dast container run failed (%s: %s)" % (type(e).__name__, e)}))
             return
         if self.path == "/scan":
             try:
                 req = self._body()
-                url, storage, urls = req.get("url"), req.get("storage_state"), req.get("urls")
-                if not url or not isinstance(storage, dict) or not isinstance(urls, list) or not urls:
-                    self._send(400, json.dumps({"error": "need url, storage_state object, and a non-empty urls list"}))
+                url, storage = req.get("url"), req.get("storage_state")
+                no_auth = bool(req.get("no_auth"))           # no-auth run needs no session
+                if not url or (not no_auth and not isinstance(storage, dict)):
+                    self._send(400, json.dumps({"error": "need url, and (unless no_auth) a storage_state object"}))
                     return
-                alerts, auth, n = zap_scan(url, storage, urls)
+                alerts, auth, n = zap_scan(url, storage, no_auth=no_auth)
                 self._send(200, json.dumps({"alerts": alerts, "auth": auth, "scanned": n, "mode": "passive"}))
             except Exception as e:
-                self._send(502, json.dumps({"error": "ZAP unreachable or failed (%s: %s). Start the daemon: "
-                                            "see modern-web-storage/README.md" % (type(e).__name__, e)}))
+                self._send(502, json.dumps({"error": "az-dast container run failed (%s: %s)" % (type(e).__name__, e)}))
             return
         if self.path != "/crawl":
             self._send(404, json.dumps({"error": "unknown path"}))
