@@ -27,35 +27,38 @@ auth material it found, then a headed-less crawl replays the session to prove it
 <label>Captured storage_state.json <span class="muted">(capture below, paste, or pick a file)</span></label>
 <div style="margin:.3rem 0 .5rem">
   <button id="capStart" type="button">1. Open login browser</button>
+  <select id="capBrowser" title="browser used for the login capture">
+    <option value="chrome">Chrome</option>
+    <option value="firefox">Firefox</option>
+    <option value="webkit">WebKit (Safari engine)</option>
+  </select>
   <button id="capDump" type="button">2. I'm logged in — capture</button>
   <span id="capMsg" class="muted"></span>
 </div>
 <input type="file" id="file" accept=".json,application/json">
 <textarea id="storage" placeholder='{ "cookies": [...], "origins": [...] }'></textarea>
 
-<label>Crawl bounds <span class="muted">(Playwright pre-flight)</span></label>
-<div style="display:flex; gap:.6rem; flex-wrap:wrap; align-items:end">
-  <span>Max pages <input id="maxPages" type="number" min="1" value="30" style="width:5rem"></span>
-  <span>Max depth <input id="maxDepth" type="number" min="1" value="5" style="width:5rem"></span>
-  <span>Max children/page <input id="maxChildren" type="number" min="1" value="20" style="width:5rem"></span>
-  <span>Max duration (s) <input id="maxDuration" type="number" min="1" value="60" style="width:5rem"></span>
+<div style="display:flex; align-items:center; gap:.9rem; flex-wrap:wrap; margin:.4rem 0">
+  <button id="goZap" type="button">Crawl with az-dast image</button>
+  <label style="display:inline; font-weight:400; margin:0">
+    <input type="checkbox" id="zapAjax"> full crawl (spider + AJAX)</label>
+  <label style="display:inline; font-weight:400; margin:0">
+    <input type="checkbox" id="zapCompare"> compare no-auth vs with-auth</label>
 </div>
-
-<button id="go">Detect + crawl (Playwright pre-flight)</button>
-<button id="goZap" type="button">Crawl with az-dast image (docker run)</button>
+<span class="muted">The az-dast image crawls the target with the captured session. Full crawl adds the AJAX/client spider. Compare runs it twice (logged-out, then with the session) — left = no auth, right = with auth.</span>
 
 <hr style="margin:1.5rem 0">
-<h2 style="font-size:1.05rem">Crawl comparison</h2>
-<p class="muted">The Playwright pre-flight (client-side, renders JS) vs the az-dast image's own crawl.
-For reference — the passive scan below runs the container, which crawls the target itself.</p>
+<h2 style="font-size:1.05rem">Crawl result</h2>
+<p class="muted">The az-dast image's own crawl of the target. With <b>compare</b> checked, the same crawl
+runs logged-out (left) and with the session (right); the difference is the authenticated surface.</p>
 <div style="display:flex; gap:1rem; flex-wrap:wrap">
   <div style="flex:1; min-width:300px">
-    <label style="font-weight:400; margin-top:0"><b>Playwright pre-flight</b> —
+    <label style="font-weight:400; margin-top:0"><b id="lblPlay">no auth</b> —
       <b id="nPlay">0</b> URLs (<span id="nPlayReal">0</span> non-asset)</label>
     <div id="outPlay" class="rbox"></div>
   </div>
   <div style="flex:1; min-width:300px">
-    <label style="font-weight:400; margin-top:0"><b>az-dast crawl</b> —
+    <label style="font-weight:400; margin-top:0"><b id="lblZap">with auth</b> —
       <b id="nZap">0</b> URLs (<span id="nZapReal">0</span> non-asset)</label>
     <div id="outZap" class="rbox"></div>
   </div>
@@ -90,14 +93,15 @@ $('file').addEventListener('change', async e => {
 });
 $('capStart').addEventListener('click', async () => {
   const msg = $('capMsg');
-  msg.textContent = 'launching Chrome...';
+  const browser = $('capBrowser').value;
+  msg.textContent = 'launching ' + browser + '...';
   try {
     const r = await fetch('/capture/start', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: $('url').value.trim() || 'about:blank' }),
+      body: JSON.stringify({ url: $('url').value.trim() || 'about:blank', browser }),
     });
     const d = await r.json();
-    msg.textContent = d.ok ? 'Chrome open — log in, then click "capture".' : ('Error: ' + d.error);
+    msg.textContent = d.ok ? (browser + ' open — log in, then click "capture".') : ('Error: ' + d.error);
   } catch (e) { msg.textContent = 'Failed: ' + e; }
 });
 $('capDump').addEventListener('click', async () => {
@@ -119,63 +123,58 @@ $('capDump').addEventListener('click', async () => {
     msg.textContent = (d.auth ? ('captured — auth: ' + d.auth.scheme + '.') : ('captured, but NO auth found: ' + d.summary + '.')) + tgt + scope;
   } catch (e) { msg.textContent = 'Failed: ' + e; }
 });
-$('go').addEventListener('click', async () => {
-  const out = $('outPlay');
-  let storage;
-  try { storage = JSON.parse($('storage').value); }
-  catch { out.textContent = 'storage_state is not valid JSON.'; return; }
-  if (!$('url').value.trim()) { out.textContent = 'Enter a target URL.'; return; }
-  out.textContent = 'Running (login replay + crawl, ~10-30s)...';
-  $('go').disabled = true;
-  try {
-    const r = await fetch('/crawl', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        url: $('url').value.trim(), storage_state: storage,
-        max_pages: +$('maxPages').value, max_depth: +$('maxDepth').value,
-        max_children: +$('maxChildren').value, max_duration: +$('maxDuration').value,
-      }),
-    });
-    const d = await r.json();
-    if (d.error) { out.textContent = 'Error: ' + d.error; return; }
-    const lines = [];
-    lines.push('Detected auth (auth_detect.py): ' + (d.auth ? JSON.stringify(d.auth) : 'NONE'));
-    lines.push('Captured session: ' + d.summary);
-    lines.push('Landed logged-in: ' + (d.logged_in ? 'YES' : 'NO (looks logged-out / login page)'));
-    lines.push('');
-    lines.push('Crawled ' + d.crawled.length + ' URL(s):');
-    d.crawled.forEach(u => lines.push('  ' + u));
-    out.textContent = lines.join('\n');
-    crawlLists.play = d.crawled; updateChooser();   // feed the compare/scan step
-  } catch (err) {
-    out.textContent = 'Request failed: ' + err;
-  } finally {
-    $('go').disabled = false;
-  }
-});
+async function zapCrawl(url, storage, ajax, noAuth) {
+  const r = await fetch('/crawl-zap', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url, storage_state: storage, ajax, no_auth: noAuth }),
+  });
+  return r.json();
+}
+function renderCrawl(el, d) {
+  if (d.error) { el.textContent = 'Error: ' + d.error; return; }
+  const lines = [];
+  lines.push('Detected auth: ' + (d.auth ? d.auth.scheme : 'NONE'));
+  lines.push('az-dast crawl: ' + d.crawled.length + ' target page(s)' +
+    '  [excluded ' + d.asset_excluded + ' asset, ' + d.external_excluded + ' external of ' +
+    d.total_touched + ' touched]');
+  d.crawled.forEach(u => lines.push('  ' + u));
+  el.textContent = lines.join('\n');
+}
 $('goZap').addEventListener('click', async () => {
-  const out = $('outZap');
   let storage;
   try { storage = JSON.parse($('storage').value); }
-  catch { out.textContent = 'storage_state is not valid JSON.'; return; }
-  if (!$('url').value.trim()) { out.textContent = 'Enter a target URL.'; return; }
-  out.textContent = 'Running the az-dast image (docker run, prod driver)... can take a few minutes.';
+  catch { $('outZap').textContent = 'storage_state is not valid JSON.'; return; }
+  const url = $('url').value.trim();
+  if (!url) { $('outZap').textContent = 'Enter a target URL.'; return; }
+  const ajax = $('zapAjax').checked;
+  const compare = $('zapCompare').checked;
+  const note = ajax ? ' (spider + AJAX, up to ~15 min each)' : ' (spider)';
   $('goZap').disabled = true;
   try {
-    const r = await fetch('/crawl-zap', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: $('url').value.trim(), storage_state: storage }),
-    });
-    const d = await r.json();
-    if (d.error) { out.textContent = 'Error: ' + d.error; return; }
-    const lines = [];
-    lines.push('Detected auth: ' + (d.auth ? d.auth.scheme : 'NONE'));
-    lines.push('az-dast crawl found ' + d.crawled.length + ' URL(s):');
-    d.crawled.forEach(u => lines.push('  ' + u));
-    out.textContent = lines.join('\n');
-    crawlLists.zap = d.crawled; updateChooser();   // feed the compare/scan step
+    $('lblPlay').textContent = 'no auth';
+    $('lblZap').textContent = 'with auth';
+    if (compare) {
+      // one no-auth crawl vs one with-auth crawl, both from the az-dast image
+      $('outPlay').textContent = 'Running no-auth crawl' + note + '...';
+      $('outZap').textContent = 'queued (runs after the no-auth crawl)...';
+      const dNo = await zapCrawl(url, storage, ajax, true);
+      renderCrawl($('outPlay'), dNo);
+      if (!dNo.error) { crawlLists.play = dNo.crawled; updateChooser(); }
+      $('outZap').textContent = 'Running with-auth crawl' + note + '...';
+      const dYes = await zapCrawl(url, storage, ajax, false);
+      renderCrawl($('outZap'), dYes);
+      if (!dYes.error) { crawlLists.zap = dYes.crawled; updateChooser(); }
+    } else {
+      // single with-auth crawl -> right panel; clear the left (no-auth) panel
+      $('outPlay').textContent = '';
+      crawlLists.play = [];
+      $('outZap').textContent = 'Running the az-dast image (docker run' + note + ')... can take a while.';
+      const d = await zapCrawl(url, storage, ajax, false);
+      renderCrawl($('outZap'), d);
+      if (!d.error) { crawlLists.zap = d.crawled; updateChooser(); }
+    }
   } catch (err) {
-    out.textContent = 'Request failed: ' + err;
+    $('outZap').textContent = 'Request failed: ' + err;
   } finally {
     $('goZap').disabled = false;
   }
