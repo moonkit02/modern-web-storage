@@ -10,6 +10,7 @@ manual test harness, not a service - no threading/queue until it's actually a se
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -26,39 +27,58 @@ try:
 except ModuleNotFoundError:
     sys.path.insert(0, str(HERE.parent / "az-scanner-api/serverless/scanner/containers/dast/ai-auth"))
     import auth_detect  # noqa: E402
+import har_observed  # noqa: E402  # vendored HAR -> observed-traffic distiller
 
-MAX_PAGES = 8
 PORT = 8099
-CDP_PORT = 9222
-CHROME = next((c for c in [
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "/Applications/Chromium.app/Contents/MacOS/Chromium",
-] if os.path.exists(c)), None)
-_chrome_proc = None
+_pw = None              # persistent Playwright (single-threaded server -> reuse across requests)
+_cap_ctx = None         # the live capture context, kept OPEN between start and dump
 _capture_url = ""       # the url capture_start opened -> its host selects the right tab at dump time
 _capture_profile = None  # fresh temp profile per launch (removed on the next launch)
+_capture_har = None     # login HAR for this capture -> distilled to observed traffic at dump
 
 
-def capture_start(url):
-    """Launch a REAL Chrome with the CDP port open, at url, in a FRESH empty profile so no
-    previously-signed-in account carries over. It's real Chrome (not automation-flagged Chromium);
-    trust is established when the user logs in (incl. MFA) during this capture."""
-    global _chrome_proc, _capture_url, _capture_profile
+def capture_start(url, browser="chrome"):
+    """Launch a browser via Playwright in a FRESH profile, at url, RECORDING a login HAR. Playwright
+    drives the browser, so storage_state (incl. localStorage) is captured reliably, and the HAR gives
+    the observed-traffic auth path. browser selects the engine: 'chrome' (system Google Chrome),
+    'firefox', or 'webkit' (Safari's engine) - firefox/webkit need `playwright install firefox webkit`.
+    The context is left OPEN until capture_dump; the single-threaded server keeps this on one thread."""
+    global _pw, _cap_ctx, _capture_url, _capture_profile, _capture_har
     import shutil
     import tempfile
-    if CHROME is None:
-        raise RuntimeError("Google Chrome not found - use capture_session.py instead")
+    from playwright.sync_api import sync_playwright
     _capture_url = url or ""
-    if _chrome_proc and _chrome_proc.poll() is None:
-        return  # already open
+    if _cap_ctx is not None:
+        try:
+            _cap_ctx.close()  # discard a prior half-finished capture
+        except Exception:
+            pass
+        _cap_ctx = None
     if _capture_profile and os.path.isdir(_capture_profile):
         shutil.rmtree(_capture_profile, ignore_errors=True)  # clean the previous run's profile
+    if _pw is None:
+        _pw = sync_playwright().start()
     _capture_profile = tempfile.mkdtemp(prefix="az-capture-")
-    _chrome_proc = subprocess.Popen([
-        CHROME, "--remote-debugging-port=%d" % CDP_PORT,
-        "--user-data-dir=" + _capture_profile, "--no-first-run",
-        "--no-default-browser-check", url or "about:blank",
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _capture_har = os.path.join(_capture_profile, "login.har")
+    headless = os.environ.get("CAPTURE_HEADLESS", "").lower() in ("1", "true", "yes")  # headed by default
+    opts = {"headless": headless, "record_har_path": _capture_har, "record_har_mode": "full"}
+    b = (browser or "chrome").lower()
+    if b in ("firefox", "ff"):
+        engine = _pw.firefox
+    elif b in ("webkit", "safari"):
+        engine = _pw.webkit
+    else:  # chrome / chromium: use the installed Google Chrome, and blunt the automation flag
+        engine = _pw.chromium
+        opts["channel"] = "chrome"
+        opts["args"] = ["--disable-blink-features=AutomationControlled", "--no-first-run", "--no-default-browser-check"]
+    try:
+        _cap_ctx = engine.launch_persistent_context(_capture_profile, **opts)
+    except Exception as e:
+        _cap_ctx = None
+        raise RuntimeError("could not launch %s (%s). For firefox/webkit first run: "
+                           "playwright install firefox webkit" % (b, e))
+    pg = _cap_ctx.pages[0] if _cap_ctx.pages else _cap_ctx.new_page()
+    pg.goto(url or "about:blank", wait_until="domcontentloaded")
 
 
 def _same_site(cookie_domain, host):
@@ -77,45 +97,53 @@ def _scope_state(state, host):
         return state, len(state.get("cookies", [])), 0  # no target -> cannot scope, keep as-is
     cookies = state.get("cookies", [])
     kept = [c for c in cookies if _same_site(c.get("domain", ""), host)]
-    origins = [o for o in state.get("origins", []) if _same_site(urlparse(o.get("origin", "")).netloc, host)]
+    origins = [o for o in state.get("origins", []) if _same_site(urlparse(o.get("origin", "")).hostname, host)]
     return {"cookies": kept, "origins": origins}, len(kept), len(cookies) - len(kept)
 
 def capture_dump(target_hint=""):
-    """Attach to that Chrome over CDP and dump storage_state (cookies + localStorage), scoped to
-    the target site only. target_hint = the url the user typed; it selects which site to keep.
-    Use 127.0.0.1, not localhost: Chrome binds CDP on IPv4 only, localhost may resolve to ::1."""
-    import time
-    import urllib.request
-    from playwright.sync_api import sync_playwright
-    endpoint = "http://127.0.0.1:%d" % CDP_PORT
-    for _ in range(10):  # Chrome needs a beat to open the debug port
+    """Read storage_state off the LIVE capture context (localStorage intact - Playwright drove it),
+    distil the login HAR to observed traffic, then close the context (which flushes the HAR).
+    target_hint = the url the user typed; it selects which site to keep. Returns the scoped state
+    (with an '_observed' blob when the login HAR yielded an auth header) plus the target and counts."""
+    global _cap_ctx
+    if _cap_ctx is None:
+        raise RuntimeError("no capture in progress - click 'Open login browser' first")
+    state = _cap_ctx.storage_state()
+    # belt-and-suspenders: read localStorage straight off each live page and merge, keyed by origin,
+    # in case storage_state() misses it. target = the tab whose host matches the launched url.
+    by_origin = {o.get("origin"): o for o in state.get("origins", [])}
+    want = urlparse(_capture_url).netloc
+    origins = []
+    for pg in _cap_ctx.pages:
+        u = urlparse(pg.url)
+        if u.scheme not in ("http", "https"):
+            continue
+        origins.append((u.netloc, "%s://%s/" % (u.scheme, u.netloc)))
         try:
-            urllib.request.urlopen(endpoint + "/json/version", timeout=1)
-            break
+            ls = pg.evaluate("() => Object.entries(window.localStorage).map(([name, value]) => ({name, value}))")
         except Exception:
-            time.sleep(0.5)
-    with sync_playwright() as p:
-        b = p.chromium.connect_over_cdp(endpoint)
-        ctx = b.contexts[0]
-        state = ctx.storage_state()
-        # target = the origin of the tab you logged in on (real host, www and all). A persistent
-        # profile can restore stale tabs, so prefer the tab whose host matches the url we launched;
-        # else the first live http(s) tab; else the session's localStorage origin.
-        want = urlparse(_capture_url).netloc
-        origins = []
-        for pg in ctx.pages:
-            u = urlparse(pg.url)
-            if u.scheme in ("http", "https"):
-                origins.append((u.netloc, "%s://%s/" % (u.scheme, u.netloc)))
-        target = next((o for host, o in origins if host == want), "")
-        if not target and origins:
-            target = origins[0][1]
-        if not target and state.get("origins"):
-            target = state["origins"][0].get("origin", "") + "/"
-        b.close()  # disconnect only; leaves your Chrome open
-    # Scope to the target site: prefer the url the user typed, else the tab we detected above.
-    host = urlparse(target_hint).netloc or urlparse(target).netloc
+            ls = None
+        if ls:
+            by_origin["%s://%s" % (u.scheme, u.netloc)] = {
+                "origin": "%s://%s" % (u.scheme, u.netloc), "localStorage": ls}
+    state["origins"] = list(by_origin.values())
+    target = next((o for host, o in origins if host == want), "") or (origins[0][1] if origins else "")
+    if not target and state.get("origins"):
+        target = state["origins"][0].get("origin", "") + "/"
+    # close to flush the HAR, then distil it to the observed-traffic auth input
+    har = _capture_har
+    try:
+        _cap_ctx.close()
+    except Exception:
+        pass
+    _cap_ctx = None
+    observed = har_observed.observed_from_har(har) if har and os.path.exists(har) else {}
+    # Scope to the target site by hostname (not netloc): a ported dev target (host.docker.internal:8077)
+    # would otherwise never match a cookie's port-less domain, dropping the whole session.
+    host = urlparse(target_hint).hostname or urlparse(target).hostname
     scoped, kept, dropped = _scope_state(state, host)
+    if observed.get("authed_requests"):
+        scoped["_observed"] = observed  # rides in the state blob; _run_az_dast splits it out to mount
     return scoped, target, kept, dropped
 
 
@@ -139,11 +167,33 @@ def _clean(urls, max_repeat=2):
         out.append(u)
     return out
 
+# Static-asset extensions, same set the prod ZAP config excludes from response processing.
+_ASSET_RE = re.compile(
+    r"\.(jpg|jpeg|png|gif|svg|ico|webp|bmp|woff|woff2|ttf|eot|otf|css|js|mjs|map|pdf|"
+    r"mp4|webm|ogg|mov|avi|mkv|flv|wmv|m4v|mp3|wav)$", re.I)
+
+def _is_asset(u):
+    return bool(_ASSET_RE.search(urlparse(u).path))
+
+def _filter_crawl(urls, target):
+    """Keep only target-host, non-asset URLs. Returns (kept, external_excluded, asset_excluded).
+    External = a different host than the target (third-party CDNs like cdnjs.cloudflare.com); asset =
+    same host but a static file. Both are counted so nothing is silently dropped."""
+    host = urlparse(target).hostname
+    kept, external, asset = [], 0, 0
+    for u in urls:
+        if urlparse(u).hostname != host:
+            external += 1
+        elif _is_asset(u):
+            asset += 1
+        else:
+            kept.append(u)
+    return kept, external, asset
+
 
 PROD_IMAGE = os.environ.get("PROD_IMAGE", "az-dast:testing")
-# Passive-relevant slice of entrypoint.sh's ZAP_CONFIGS (keep in sync). Active-scan/AJAX keys are
-# left out on purpose: baseline mode never active-scans, and the AJAX spider needs a browser that
-# crashes under amd64 emulation on this Mac.
+PROD_PLATFORM = os.environ.get("PROD_PLATFORM", "")   # empty = image's native arch; e.g. linux/amd64
+# Passive-relevant slice of entrypoint.sh's ZAP_CONFIGS (keep in sync).
 PROD_ZAP_CONFIG = (
     "-config http.response.max_size=1048576 "
     "-config http.exclude_response_regex=.*\\.(jpg|jpeg|png|gif|svg|woff|woff2|ico|pdf|css|js|ttf|eot|otf|mp4|webm|ogg|mov|avi|mkv|flv|wmv|m4v) "
@@ -154,25 +204,53 @@ PROD_ZAP_CONFIG = (
     "-config spider.maxChildren=30 "
     "-config spider.maxDuration=1800"
 )
+# AJAX-spider keys, also from entrypoint.sh. Only added for a full crawl (-j). In this image -j drives
+# ZAP 2.17's Client Spider (Chromium). Under amd64 emulation on this Mac it starts but stalls at 0%
+# (Chrome can't drive), so it adds ~no URLs and just runs to its time limit; it works on a real amd64 host.
+PROD_AJAX_CONFIG = (
+    " -config ajaxSpider.maxDuration=15 "
+    "-config ajaxSpider.maxCrawlDepth=10 "
+    "-config ajaxSpider.numberOfBrowsers=4 "
+    "-config ajaxSpider.randomInputs=true "
+    "-config ajaxSpider.browserId=chrome-headless "
+    "-config selenium.chromeDriver=/usr/bin/chromedriver "
+    "-config selenium.chromeBinary=/usr/local/bin/chromium-nosandbox"
+)
 
-def _run_az_dast(url, storage_state, timeout=1200):
+def _run_az_dast(url, storage_state, ajax=False, timeout=1800):
     """The one place a scan actually runs: docker run the real az-dast image through its prod driver
     (zap-baseline.py + the prod hook). storage_state=None runs logged-out; a dict is injected the prod
-    way (SESSION_FILE -> az_ai_auth.py inside the image). Baseline = spider + passive, no active scan.
-    Returns {urls, alerts, exit_code, log_tail}. Skips only the entrypoint's S3-upload tail (cloud
-    creds) and the AJAX spider (its browser crashes under amd64 emulation on this Mac)."""
+    way (SESSION_FILE -> az_ai_auth.py inside the image). ajax=True adds the AJAX spider (-j) for a
+    full prod crawl (spider + AJAX). No active scan either way. Returns {urls, alerts, exit_code,
+    log_tail}. Skips only the entrypoint's S3-upload tail (needs cloud creds)."""
     name = "az-dast-" + os.urandom(4).hex()
     sess = None
-    cmd = ["docker", "run", "-d", "--name", name, "--platform", "linux/amd64", "-m", "4g"]
+    obs_file = None
+    mem = "6g" if ajax else "4g"                            # AJAX runs several browsers; give it room
+    # Default to the image's native arch. On an arm64 host use an arm64 build (Dockerfile.arm64) so
+    # Chromium runs natively; set PROD_PLATFORM=linux/amd64 only when running the amd64 image.
+    cmd = ["docker", "run", "-d", "--name", name, "-m", mem]
+    if PROD_PLATFORM:
+        cmd += ["--platform", PROD_PLATFORM]
     if storage_state is not None:
+        st = dict(storage_state)
+        observed = st.pop("_observed", None)               # rides in the blob; write it as its own file
         sess = HERE / (".session-%s.json" % name)          # project dir is a Docker-shared path
-        sess.write_text(json.dumps(storage_state))
+        sess.write_text(json.dumps(st))
         cmd += ["-v", "%s:/app/resources/session.json:ro" % sess,
                 "-e", "SESSION_FILE=/app/resources/session.json", "-e", "AI_AUTH_DIR=/app"]
+        if observed:
+            # az_ai_auth.detect_auth reads auth-observed.json beside the session file, so mount it
+            # there. Lets the container use the observed auth header (in-memory JWT that is not in
+            # localStorage/cookies); harmless when the storage path already found the token.
+            obs_file = HERE / (".observed-%s.json" % name)
+            obs_file.write_text(json.dumps(observed))
+            cmd += ["-v", "%s:/app/resources/auth-observed.json:ro" % obs_file]
     cmd += ["--entrypoint", "zap-baseline.py", PROD_IMAGE,
             "-t", url, "-I", "-d", "-J", "report.json",
-            "--hook", "/zap/wrk/hook/az-custom-hook.py",
-            "-z", PROD_ZAP_CONFIG]
+            "--hook", "/zap/wrk/hook/az-custom-hook.py"]
+    cmd += ["-j"] if ajax else []                           # -j = add the AJAX spider (full crawl)
+    cmd += ["-z", PROD_ZAP_CONFIG + (PROD_AJAX_CONFIG if ajax else "")]
     try:
         run = subprocess.run(cmd, capture_output=True, text=True)
         if run.returncode != 0:
@@ -194,6 +272,8 @@ def _run_az_dast(url, storage_state, timeout=1200):
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)
         if sess is not None:
             sess.unlink(missing_ok=True)
+        if obs_file is not None:
+            obs_file.unlink(missing_ok=True)
 
 def _report_uris(data):
     """Every URL ZAP recorded a finding on, from the baseline JSON report's alert instances."""
@@ -222,12 +302,14 @@ def _detect_auth(storage_state):
     finally:
         os.unlink(spath)
 
-def zap_crawl(url, storage_state):
+def zap_crawl(url, storage_state, ajax=False, no_auth=False):
     """zap_crawl(url, storage_state) -> docker run the prod img -> read the crawled URL list from its
     report/log -> return (urls, auth_for_display). The image crawls the target with the session
-    injected via SESSION_FILE. Baseline passive-scans too; here we keep only the URLs."""
-    r = _run_az_dast(url, storage_state)
-    return r["urls"], (_detect_auth(storage_state) or None)
+    injected via SESSION_FILE. ajax=True runs the full prod crawl (spider + AJAX). no_auth=True runs
+    logged-out (no session), so the same crawl can be compared with vs without auth."""
+    r = _run_az_dast(url, None if no_auth else storage_state, ajax=ajax)
+    auth = None if no_auth else (_detect_auth(storage_state) or None)
+    return r["urls"], auth
 
 def zap_scan(url, storage_state, no_auth=False):
     """zap_scan(...) -> docker run the same prod img -> read the passive alerts from its report ->
@@ -236,62 +318,6 @@ def zap_scan(url, storage_state, no_auth=False):
     r = _run_az_dast(url, None if no_auth else storage_state)
     auth = None if no_auth else (_detect_auth(storage_state) or None)
     return r["alerts"], auth, len(r["urls"])
-
-def crawl(url, storage_state, max_pages=8, max_depth=2, max_children=20, max_duration=60):
-    """Replay the captured session; BFS same-origin links. Returns (visited_urls, logged_in_guess).
-    Spider-style bounds (like ZAP): max_pages total pages, max_depth link hops from the start,
-    max_children links followed per page, max_duration seconds hard stop."""
-    import time
-    from playwright.sync_api import sync_playwright
-
-    host = urlparse(url).netloc
-    visited, queue, out = set(), [(url, 0)], []   # queue holds (url, depth)
-    logged_in = None
-    deadline = time.time() + max_duration
-    with sync_playwright() as p:
-        # Real Chrome + visible + automation flag off: far less bot-detectable than headless
-        # Chromium. Anti-bot sites (Shopee/DataDome) redirect a headless crawler to a
-        # /verify/traffic wall even with a valid session. This helps; enterprise WAFs may still block.
-        launch = {"headless": False, "args": ["--disable-blink-features=AutomationControlled"]}
-        if CHROME:
-            launch["channel"] = "chrome"
-        browser = p.chromium.launch(**launch)
-        ctx = browser.new_context(storage_state=storage_state)
-        page = ctx.new_page()
-        try:
-            while queue and len(out) < max_pages and time.time() < deadline:
-                u, depth = queue.pop(0)
-                if u in visited:
-                    continue
-                visited.add(u)
-                try:
-                    page.goto(u, wait_until="domcontentloaded", timeout=20000)
-                    page.wait_for_timeout(1500)  # let SPA render its routerLinks
-                except Exception:
-                    continue
-                if urlparse(page.url).netloc != host:
-                    continue  # a same-origin link that redirected offsite (e.g. open-redirect)
-                out.append(page.url)
-                if logged_in is None:  # judge on the landing page only
-                    low = page.url.lower()
-                    has_pw = page.query_selector("input[type='password']") is not None
-                    logged_in = not (("login" in low or "signin" in low) or has_pw)
-                if depth >= max_depth:
-                    continue  # reached the depth limit; don't enqueue this page's links
-                try:
-                    hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
-                except Exception:
-                    hrefs = []
-                added = 0
-                for h in hrefs:
-                    if added >= max_children:
-                        break  # cap links followed per page
-                    if urlparse(h).netloc == host and h not in visited and all(h != q for q, _ in queue):
-                        queue.append((h, depth + 1))
-                        added += 1
-        finally:
-            browser.close()
-    return out, bool(logged_in)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -316,8 +342,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/capture/start":
             try:
-                capture_start(self._body().get("url", ""))
-                self._send(200, json.dumps({"ok": True, "port": CDP_PORT}))
+                body = self._body()
+                capture_start(body.get("url", ""), body.get("browser", "chrome"))
+                self._send(200, json.dumps({"ok": True}))
             except Exception as e:
                 self._send(500, json.dumps({"error": str(e)}))
             return
@@ -342,11 +369,20 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 req = self._body()
                 url, storage = req.get("url"), req.get("storage_state")
-                if not url or not isinstance(storage, dict):
+                no_auth = bool(req.get("no_auth"))       # no-auth run needs no session
+                if not url or (not no_auth and not isinstance(storage, dict)):
                     self._send(400, json.dumps({"error": "need url and storage_state object"}))
                     return
-                results, auth = zap_crawl(url, storage)
-                self._send(200, json.dumps({"crawled": results, "auth": auth, "engine": "az-dast-baseline"}))
+                ajax = bool(req.get("ajax"))             # full crawl = spider + AJAX
+                results, auth = zap_crawl(url, storage, ajax=ajax, no_auth=no_auth)
+                # show only the target's own pages: drop third-party hosts and static assets,
+                # reporting how many of each were hidden so the count is transparent
+                kept, external_excluded, asset_excluded = _filter_crawl(results, url)
+                self._send(200, json.dumps({"crawled": kept, "auth": auth,
+                                            "external_excluded": external_excluded,
+                                            "asset_excluded": asset_excluded,
+                                            "total_touched": len(results),
+                                            "engine": "az-dast-full" if ajax else "az-dast-baseline"}))
             except Exception as e:
                 self._send(502, json.dumps({"error": "az-dast container run failed (%s: %s)" % (type(e).__name__, e)}))
             return
@@ -363,36 +399,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(502, json.dumps({"error": "az-dast container run failed (%s: %s)" % (type(e).__name__, e)}))
             return
-        if self.path != "/crawl":
-            self._send(404, json.dumps({"error": "unknown path"}))
-            return
-        try:
-            n = int(self.headers.get("Content-Length", 0))
-            req = json.loads(self.rfile.read(n) or b"{}")
-            url, storage = req.get("url"), req.get("storage_state")
-            if not url or not isinstance(storage, dict):
-                self._send(400, json.dumps({"error": "need url and storage_state object"}))
-                return
-            # token-scrape wants a file path
-            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-                json.dump(storage, f)
-                spath = f.name
-            auth = auth_detect.detect_auth(spath)
-            summary = auth_detect.storage_summary(spath)
-            # spider-style bounds from the UI (fall back to the defaults if absent/blank)
-            def _int(key, default):
-                try: return max(1, int(req.get(key)))
-                except (TypeError, ValueError): return default
-            crawled, logged_in = crawl(
-                url, storage,
-                max_pages=_int("max_pages", 8), max_depth=_int("max_depth", 2),
-                max_children=_int("max_children", 20), max_duration=_int("max_duration", 60))
-            self._send(200, json.dumps({
-                "auth": auth, "summary": summary,
-                "logged_in": logged_in, "crawled": crawled,
-            }))
-        except Exception as e:
-            self._send(500, json.dumps({"error": "%s: %s" % (type(e).__name__, e)}))
+        self._send(404, json.dumps({"error": "unknown path"}))
 
     def log_message(self, *a):  # quieter console
         pass
