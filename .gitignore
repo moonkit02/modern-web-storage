@@ -4,3 +4,6 @@
 # Python
 __pycache__/
 *.pyc
+
+# Local Playwright venv (created by setup.sh)
+.venv-pw/
